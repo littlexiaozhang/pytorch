@@ -5,7 +5,11 @@ import torch
 import torch._dynamo.test_case
 from torch._dynamo.testing import CompileCounter, EagerAndRecordGraphs, normalize_gm
 from torch.testing._internal.common_cuda import TEST_CUDA
-from torch.testing._internal.common_utils import TEST_XPU
+from torch.testing._internal.common_utils import (
+    TEST_XPU, 
+    TEST_PRIVATEUSE1,
+)
+from torch.testing._internal.common_device_type import instantiate_device_type_tests
 
 
 device_type = (
@@ -80,7 +84,7 @@ class GraphModule(torch.nn.Module):
 """,
         )
 
-    @unittest.skipIf(not TEST_CUDA and not TEST_XPU, "requires cuda or xpu")
+    @unittest.skipIf(not TEST_CUDA and not TEST_XPU and not TEST_PRIVATEUSE1, "requires cuda or xpu or privateUse1")
     def test_dispatch_key_set_guard(self):
         counter = CompileCounter()
 
@@ -165,6 +169,7 @@ class GraphModule(torch.nn.Module):
                 torch._C.DispatchKey.PythonTLSSnapshot, saved_python_tls_snapshot
             )
 
+instantiate_device_type_tests(PythonDispatcherTests, globals(), allow_xpu=True)
 
 if __name__ == "__main__":
     from torch._dynamo.test_case import run_tests
