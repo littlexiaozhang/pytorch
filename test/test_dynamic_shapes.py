@@ -47,8 +47,9 @@ from torch.fx.experimental.symbolic_shapes import (
     SYMPY_INTERP,
 )
 from torch.testing._internal.common_device_type import (
+    Capability,
     instantiate_device_type_tests,
-    onlyAccelerator,
+    requires_capabilities,
 )
 from torch.testing._internal.common_dtype import all_types_and
 from torch.testing._internal.common_utils import (
@@ -5473,19 +5474,6 @@ def forward(self, arg0_1: "i64[1][1]cpu", arg1_1: "Sym(u1)", arg2_1: "i64[u1][1]
         """Test narrow with unbacked start with cpp_wrapper"""
         self.test_narrow_unbacked_start()
 
-    @torch._dynamo.config.patch(capture_scalar_outputs=True)
-    def test_narrow_with_tensor_start(self):
-        @torch.compile(backend="inductor", fullgraph=True)
-        def f(x, start, end):
-            return torch.narrow(x, 0, start, end)
-
-        x = torch.tensor(
-            [False], device="cuda:0" if torch.cuda.is_available() else "cpu"
-        )
-        start = torch.tensor(0)
-        res = f(x, start, 0)
-        self.assertEqual(res.shape, torch.Size([0]))
-
     @skipIfTorchDynamo("mark_unbacked not supported")
     def test_unbacked_norm_no_dde(self):
         def vector_norm(x):
@@ -7132,7 +7120,7 @@ class TestTransferSymbolsFromForeignShapeEnvDevice(TestCase):
 
     hw_classification = HardwareClassification.ACCELERATOR
 
-    @onlyAccelerator
+    @requires_capabilities(Capability.attention.flex_attention)
     def test_flex_attention_foreign_fake_e2e(self, device):
         """E2E test: trace flex_attention with BlockMask containing unbacked dims
         through a fresh FakeTensorMode, exercising the foreign ShapeEnv transfer path."""
@@ -7327,11 +7315,22 @@ class TestTransferSymbolsFromForeignShapeEnvDevice(TestCase):
             lambda msg: f"{msg}\nExpected at least 4 unbacked dims but found {unbacked_count}",
         )
 
+    @torch._dynamo.config.patch(capture_scalar_outputs=True)
+    def test_narrow_with_tensor_start(self, device):
+        @torch.compile(backend="inductor", fullgraph=True)
+        def f(x, start, end):
+            return torch.narrow(x, 0, start, end)
+
+        x = torch.tensor([False], device=device)
+        start = torch.tensor(0, device=device)
+        res = f(x, start, 0)
+        self.assertEqual(res.shape, torch.Size([0]))
+
 
 instantiate_device_type_tests(
     TestTransferSymbolsFromForeignShapeEnvDevice,
     globals(),
-    only_for=("cuda", "xpu"),
+    except_for="cpu",
     allow_xpu=True,
 )
 
