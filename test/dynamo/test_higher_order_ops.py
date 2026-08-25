@@ -7349,6 +7349,7 @@ class ActivationCheckpointingTestsDevice(torch._dynamo.test_case.TestCase):
                 return torch.sigmoid(self.linear(x))
 
         mod = MockModule()
+        mod = mod.to(device)
 
         def fn(x):
             return torch.utils.checkpoint.checkpoint(
