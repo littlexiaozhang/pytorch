@@ -20,19 +20,19 @@ from torch._dynamo.testing import (
 )
 from torch._dynamo.utils import counters
 from torch.nn import functional as F
-from torch.testing._internal.common_cuda import PLATFORM_SUPPORTS_FLASH_ATTENTION
 from torch.testing._internal.common_device_type import (
+    Capability,
     instantiate_device_type_tests,
-    onlyCUDA,
+    requires_capabilities,
+    skipXPU,
 )
 from torch.testing._internal.common_utils import (
+    HardwareClassification,
     instantiate_parametrized_tests,
     parametrize,
 )
 from torch.testing._internal.triton_utils import requires_cuda_and_triton
 
-
-device_type = acc.type if (acc := torch.accelerator.current_accelerator()) else "cpu"
 
 try:
     from . import test_functions
@@ -102,7 +102,31 @@ def _graph_break(x):
     return x
 
 
+def _graph_break_inlining_autocast_test_helper(self, device):
+    def gn(x, y):
+        with torch.autocast(
+            device_type=torch.device(device).type, dtype=torch.bfloat16
+        ):
+            z = torch.mm(x, y)
+            torch._dynamo.graph_break()
+            return torch.sin(z)
+
+    def fn(x, y):
+        z = torch.mm(x, y)
+        z = z + gn(x, y)
+        return z
+
+    x = torch.rand(3, 3).to(device)
+    y = torch.rand(3, 3).to(device)
+    opt_fn = torch.compile(backend="eager")(fn)
+    ref = fn(x, y)
+    res = opt_fn(x, y)
+    self.assertEqual(ref, res)
+
+
 class CtxManagerTests(torch._dynamo.test_case.TestCase):
+    hw_classification = HardwareClassification.GENERIC
+
     def test_no_grad(self):
         def fn1(a, b):
             x = a + 1
@@ -513,67 +537,6 @@ class CtxManagerTests(torch._dynamo.test_case.TestCase):
         opt_fn = torch.compile(fn, backend="eager", fullgraph=True)
         res = opt_fn(a, b)
         self.assertTrue(same(ref, res))
-
-    @unittest.skipIf(
-        not PLATFORM_SUPPORTS_FLASH_ATTENTION,
-        "Can't run fused SDPA on this platform",
-    )
-    def test_autocast_sdpa(self):
-        class MyModule(torch.nn.Module):
-            def forward(self, query, key, value):
-                with torch.autocast("cpu"):
-                    with torch.autocast(device_type, dtype=torch.float32):
-                        out = F.scaled_dot_product_attention(
-                            query, key, value, None, 0.0, True
-                        )
-                return out
-
-        dtype = torch.float32
-        seq_len_q = 1
-        seq_len_k = 1
-        head_dim = 8
-        query = torch.ones(
-            1,
-            8,
-            seq_len_q,
-            head_dim,
-            device=device_type,
-            dtype=dtype,
-            requires_grad=True,
-        )
-        key = torch.ones(
-            1,
-            8,
-            seq_len_k,
-            head_dim,
-            device=device_type,
-            dtype=dtype,
-            requires_grad=True,
-        )
-        value = torch.ones(
-            1,
-            8,
-            seq_len_k,
-            head_dim,
-            device=device_type,
-            dtype=dtype,
-            requires_grad=True,
-        )
-
-        module = MyModule()
-        real = module(query, key, value)
-        real_device = real.device
-        real_dtype = real.dtype
-
-        opt_mod = torch.compile(module, backend="inductor")
-        compiled = opt_mod(query, key, value)
-
-        self.assertEqual(compiled.device, real_device)
-        self.assertEqual(compiled.dtype, real_dtype)
-
-        self.assertEqual(compiled.device.type, device_type)
-        self.assertEqual(compiled.device.index, 0)
-        self.assertEqual(compiled.dtype, torch.float32)
 
     def test_autocast_ctor_signature_is_pinned(self):
         # builder.py and ctx_manager.py each hard-code this parameter list, in
@@ -1444,36 +1407,8 @@ class GraphModule(torch.nn.Module):
 
         self.assertEqual(cnts.frame_count, 2)
 
-    def _graph_break_inlining_autocast_test_helper(self, device):
-        def gn(x, y):
-            with torch.autocast(device_type=device, dtype=torch.bfloat16):
-                z = torch.mm(x, y)
-                torch._dynamo.graph_break()
-                return torch.sin(z)
-
-        def fn(x, y):
-            z = torch.mm(x, y)
-            z = z + gn(x, y)
-            return z
-
-        x = torch.rand(3, 3).to(device)
-        y = torch.rand(3, 3).to(device)
-        opt_fn = torch.compile(backend="eager")(fn)
-        ref = fn(x, y)
-        res = opt_fn(x, y)
-        self.assertEqual(ref, res)
-
     def test_graph_break_inlining_autocast(self):
-        for device in ["cuda", "cpu", "xpu"]:
-            if device == "cuda" and not (
-                torch.cuda.is_available() and torch.cuda.is_bf16_supported()
-            ):
-                continue
-            if device == "xpu" and not (
-                torch.xpu.is_available() and torch.xpu.is_bf16_supported()
-            ):
-                continue
-            self._graph_break_inlining_autocast_test_helper(device)
+        _graph_break_inlining_autocast_test_helper(self, "cpu")
 
     def test_disable_saved_tensors_hooks(self):
         def fn(z):
@@ -3550,6 +3485,8 @@ class ComprehensionGeneratorTests(torch._dynamo.test_case.TestCase):
 
 
 class CtxManagerTestsDevice(torch._dynamo.test_case.TestCase):
+    hw_classification = HardwareClassification.ACCELERATOR
+
     def test_stream_context_manager1(self, device):
         def fn(x):
             s = torch.Stream(device=device)
@@ -3874,7 +3811,7 @@ class CtxManagerTestsDevice(torch._dynamo.test_case.TestCase):
             with new_stream:
                 x = torch.add(x, 4)
 
-            new_event = torch.Event()
+            new_event = torch.Event(device=device)
             new_event.record(new_stream)
 
             new_event.wait(cur_stream)
@@ -3909,11 +3846,8 @@ class CtxManagerTestsDevice(torch._dynamo.test_case.TestCase):
         res = opt_fn(x)
         self.assertEqual(ref, res)
 
-    @onlyCUDA
+    @requires_capabilities(Capability.dtype.bf16)
     def test_autocast_bf16(self, device):
-        if not torch.cuda.is_bf16_supported():
-            raise unittest.SkipTest("requires bf16")
-
         device_type = torch.device(device).type
 
         class MyModule(torch.nn.Module):
@@ -3942,7 +3876,7 @@ class CtxManagerTestsDevice(torch._dynamo.test_case.TestCase):
         self.assertEqual(exported.dtype, torch.bfloat16)
 
     # autocast with float64 not support on XPU
-    @onlyCUDA
+    @skipXPU
     def test_amp_autocast(self, device):
         device_type = torch.device(device).type
 
@@ -3969,7 +3903,7 @@ class CtxManagerTestsDevice(torch._dynamo.test_case.TestCase):
         self.assertEqual(exported.device.index, 0)
         self.assertEqual(exported.dtype, torch.float64)
 
-    @onlyCUDA
+    @skipXPU
     def test_autocast_float64(self, device):
         device_type = torch.device(device).type
 
@@ -4089,6 +4023,70 @@ class CtxManagerTestsDevice(torch._dynamo.test_case.TestCase):
         self.assertTrue(same(ref, res))
         self.assertTrue(res[0].dtype == torch.float16)
         self.assertTrue(res[1].dtype == torch.float16)
+
+    @requires_capabilities(Capability.attention.flash_attention)
+    def test_autocast_sdpa(self, device):
+        device_type = torch.device(device).type
+
+        class MyModule(torch.nn.Module):
+            def forward(self, query, key, value):
+                with torch.autocast("cpu"):
+                    with torch.autocast(device_type, dtype=torch.float32):
+                        out = F.scaled_dot_product_attention(
+                            query, key, value, None, 0.0, True
+                        )
+                return out
+
+        dtype = torch.float32
+        seq_len_q = 1
+        seq_len_k = 1
+        head_dim = 8
+        query = torch.ones(
+            1,
+            8,
+            seq_len_q,
+            head_dim,
+            device=device,
+            dtype=dtype,
+            requires_grad=True,
+        )
+        key = torch.ones(
+            1,
+            8,
+            seq_len_k,
+            head_dim,
+            device=device,
+            dtype=dtype,
+            requires_grad=True,
+        )
+        value = torch.ones(
+            1,
+            8,
+            seq_len_k,
+            head_dim,
+            device=device,
+            dtype=dtype,
+            requires_grad=True,
+        )
+
+        module = MyModule()
+        real = module(query, key, value)
+        real_device = real.device
+        real_dtype = real.dtype
+
+        opt_mod = torch.compile(module, backend="inductor")
+        compiled = opt_mod(query, key, value)
+
+        self.assertEqual(compiled.device, real_device)
+        self.assertEqual(compiled.dtype, real_dtype)
+
+        self.assertEqual(compiled.device.type, device_type)
+        self.assertEqual(compiled.device.index, 0)
+        self.assertEqual(compiled.dtype, torch.float32)
+
+    @requires_capabilities(Capability.dtype.bf16)
+    def test_graph_break_inlining_autocast_acc(self, device):
+        _graph_break_inlining_autocast_test_helper(self, device)
 
 
 class ContextlibContextManagerTests(torch._dynamo.test_case.TestCase):
